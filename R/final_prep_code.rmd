@@ -1,0 +1,566 @@
+---
+title: "Final Prep Code"
+author: "Jake Sauter"
+date: "5/15/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE,
+                      comment = NA, 
+                      eval = FALSE)
+```
+
+## **Final Topics**
+
+From Prof. Mezey: 
+
+* Analyze GWAS data using a linear regression with and without covariates
+* Analyze GWAS data using a logistic regression with and without covariates 
+* Manhattan and QQ plots
+
+
+
+**Libraries Used**
+
+```{r}
+library(knitr)      # Tidy tables 
+library(MASS)       # ginv()
+library(dplyr)      # data.frame manipulation
+library(ggplot2)    # Plotting
+library(magrittr)   # %>% (pipe operator)
+library(patchwork)  # Combining ggplots
+library(parallel)
+```
+
+## **QQ Plots**
+
+```{r}
+plot_uniform_qq <- function(p_values, pheno_name) {
+
+  uniform_quantiles <-
+    qunif(ppoints(length(p_values)))
+
+  p <-
+    data.frame(p_values          = sort(p_values),
+               uniform_quantiles = sort(uniform_quantiles)) %>%
+    ggplot() +
+      geom_point(aes(x = -log10(uniform_quantiles),
+                     y = -log10(p_values))) +
+      geom_abline(intercept = 0,
+                  slope = 1,
+                  color="red",
+                  lty = 2) +
+      xlab('-log10(Uniform Quantiles)') +
+      ylab('-log10(P Values)') +
+      ggtitle(pheno_name)
+
+  p
+}
+```
+
+## **Manhattan Plots**
+
+```{r}
+plot_manhattan <- function(p_values, plot_title,
+                           start = NULL, end = NULL) {
+
+
+  ## Correlate p-values to genomic locations with snp_info
+  # unique_chromosomes <-
+  #   snp_info$chromosome %>%
+  #   unique()
+  # 
+  # chromosome_offsets <-
+  #   sapply(unique_chromosomes,
+  #     function(chromosome) {
+  #       offset <-
+  #         max(snp_info[snp_info['chromosome'] == chromosome,
+  #                      'position'])
+  #       names(offset) <- chromosome
+  #       offset
+  #   })
+  # 
+  # genomic_locations <-
+  #   snp_info[snp_info['id'] == names(p_values), ]  %>%
+  #   mutate(position =
+  #            if_else(chromosome == 1,
+  #                    position,
+  #                    position + sum(chromosome_offsets[1:chromosome-1]))) %>%
+  #   .$position
+
+  n_genotypes <- length(p_values)
+
+  df <-
+    data.frame(
+      # genome_location = genomic_locations,
+      genome_location = seq_along(p_values), 
+      pval = p_values) %>%
+    mutate(plot_pval = -log10(pval))
+
+  # localizing manhattan plot to better show
+  # hits in the provided range
+  # if(!is.null(start) && !is.null(end)) {
+  #   df <- df %>%
+  #     filter(genome_location >= start &
+  #            genome_location <= end)
+  # }
+
+
+  p <-
+    df %>%
+    ggplot() +
+    geom_point(aes(x = genome_location, y = plot_pval),
+               col = 'skyblue', shape = 21) +
+    geom_hline(aes(yintercept = -log10(0.05 / n_genotypes),
+               color = 'red'), lty = 2, lwd = 1.1) 
+
+  p
+}
+```
+
+
+
+## **Load Data**
+
+```{r}
+lab_11_data_dir <- '~/Documents/Weill_Cornell/Quant_Genomics/lab/Lab_11/'
+
+Y <- read.table(file.path(lab_11_data_dir, "phenotypes-logistic.tsv"),
+                header = TRUE,
+                stringsAsFactors = FALSE)
+
+
+geno <- read.table(file.path(lab_11_data_dir, 
+                             "genotypes-logistic.tsv"),
+                             header = TRUE)
+
+covar_value <- read.table(file.path(lab_11_data_dir, 
+                                    "covar-logistic.tsv"), 
+                          header = TRUE)
+```
+
+
+
+```{r}
+Y <- as.matrix(Y)
+colnames(Y) <- NULL
+
+logistic_Y <- Y
+logistic_Y[Y[,1] < 0.5, 1] <- 0
+logistic_Y[Y[,1] > 0.5, 1] <- 1
+
+xa_matrix <- as.matrix(geno)
+xd_matrix <- 1 - 2*abs(xa_matrix)
+```
+
+
+## **Linear Regression GWAS**
+
+### **Without Covariates using lm()**
+
+```{r}
+perform_gwas_no_covs <- function(genotypes, phenotype) {
+  n_genotypes <- ncol(genotypes)
+
+  gwas_results <-
+    mclapply(seq_len(n_genotypes),
+      function(genotype) {
+        model <- lm(phenotype ~ xa_matrix[,genotype] +
+                                xd_matrix[,genotype])
+
+        p_val <-
+          summary(model) %>%
+          .$fstatistic %>%
+          {pf(.[1], .[2], .[3],
+              lower.tail = FALSE)}
+
+        names(p_val) <-
+          colnames(genotypes)[genotype]
+
+        p_val
+      }, mc.cores = 7)
+
+  unlist(gwas_results)
+}
+
+lm_no_covs_pvals <- perform_gwas_no_covs(geno, Y)
+
+plot_uniform_qq(lm_no_covs_pvals, 'lm() no covariates') + 
+  plot_manhattan(lm_no_covs_pvals)
+```
+
+### **Without Covariates from Scratch**
+
+```{r}
+pval_calculator <- function(pheno_input, xa_input, xd_input){
+    n_samples <- length(xa_input)
+    X_mx <- cbind(1,xa_input,xd_input)
+    
+    MLE_beta <- ginv(t(X_mx) %*% X_mx) %*% t(X_mx) %*% pheno_input
+    y_hat <- X_mx %*% MLE_beta
+  
+    SSM <- sum((y_hat - mean(pheno_input))^2)
+    SSE <- sum((pheno_input - y_hat)^2)
+  
+    df_M <- 2
+    df_E <- n_samples - 3 
+  
+    MSM <- SSM / df_M
+    MSE <- SSE / df_E
+  
+    Fstatistic <- MSM / MSE
+  
+    # to check if it is correct 
+    pval <- pf(Fstatistic, df_M, df_E,lower.tail = FALSE)
+    return(pval)
+}
+
+scratch_no_covs_pvals <- rep(0,ncol(xa_matrix))
+
+for (i in 1:ncol(xa_matrix)) {
+  scratch_no_covs_pvals[i] <- pval_calculator(Y, xa_matrix[,i], xd_matrix[,i])
+}
+
+plot_uniform_qq(scratch_no_covs_pvals, 'From Scratch No Covariates') + 
+  plot_manhattan(scratch_no_covs_pvals)
+```
+
+### **Comparing**
+
+```{r}
+plot_manhattan(scratch_no_covs_pvals) + 
+  plot_manhattan(lm_no_covs_pvals) 
+
+```
+
+
+```{r}
+not_the_same <- which(!near(lm_no_covs_pvals, scratch_no_covs_pvals, tol = 1e-3))
+
+ggplot() + 
+  geom_point(aes(x = lm_no_covs_pvals[not_the_same] %>% unname(), 
+                 y = scratch_no_covs_pvals[not_the_same])) + 
+  geom_abline(aes(intercept = 0, slope = 1), 
+              color = 'red', lty = 2) + 
+  xlab('LM()') + 
+  ylab('From Scratch')
+```
+
+
+### **With Covariates using lm()**
+
+```{r}
+perform_gwas_with_covs <- function(genotypes, phenotype) {
+  n_genotypes <- ncol(genotypes)
+
+  gwas_results <-
+    mclapply(seq_len(n_genotypes),
+      function(genotype) {
+        model <- lm(phenotype ~ Xa[,genotype] +
+                                Xd[,genotype] +
+                                covar_value[, 1], 
+                                covar_value[, 2], 
+                                covar_value[, 3])
+
+        p_val <-
+          summary(model) %>%
+          .$fstatistic %>%
+          {pf(.[1], .[2], .[3],
+              lower.tail = FALSE)}
+
+        names(p_val) <-
+          colnames(genotypes)[genotype]
+
+        p_val
+      }, mc.cores = 7)
+
+  unlist(gwas_results)
+}
+
+
+lm_with_covs_pvals <- perform_gwas_no_covs(geno, Y)
+
+plot_uniform_qq(lm_with_covs_pvals, 'lm() with covariates') + 
+  plot_manhattan(lm_with_covs_pvals)
+```
+
+
+### **With covariates from Scratch**
+
+```{r}
+pval_calculator_w_covars <- 
+  function(pheno_input, xa_input, xd_input, xz_input){
+    
+    n_samples <- length(pheno_input)
+    
+    # x_mx <- #create your X matrix under H1
+    x_mx <- 
+      cbind(
+        rep(1,length(xa_input)), 
+        xa_input, 
+        xd_input, 
+        xz_input) %>% 
+      as.matrix()
+    
+    # Calculate your MLE of the betas
+    MLE_beta <- 
+      ginv(t(x_mx) %*% x_mx) %*%
+      t(x_mx) %*% pheno_input
+    
+    # Calculate y_hat under H1  
+    y_hat_1 <- x_mx %*% MLE_beta
+    
+    # Calculate x, MLE and y under H_0  
+    x_h0 <- cbind(rep(1, length(xa_input)), 
+                  xz_input) %>% 
+      as.matrix()
+    MLE_h0 <- ginv(t(x_h0) %*% x_h0) %*% t(x_h0) %*% pheno_input
+    y_hat_0 <- x_h0 %*% MLE_h0
+    
+    # Calculate SSE under H_0 and H_1
+    SSE_theta_0 = sum((pheno_input - y_hat_0)^2)
+    SSE_theta_1 = sum((pheno_input - y_hat_1)^2)
+    
+    #set your degrees of freedom
+    df_m <- 2
+    df_e <- n_samples - 4 # 4 here as b_mu, ba, bd, one covariate
+    
+    #calculate your F statistic
+    numerator <- (SSE_theta_0-SSE_theta_1) / df_m
+    denom <- SSE_theta_1 / df_e
+    Fstatistic <- numerator / denom
+    
+    pval <- pf(Fstatistic, 
+               df_m, 
+               df_e,
+               lower.tail = FALSE)
+    
+    return(pval)
+  }
+```
+
+```{r}
+scratch_with_covs_pvals <- rep(0,ncol(xa_matrix))
+
+for (i in 1:ncol(xa_matrix)) {
+  scratch_with_covs_pvals[i] <- pval_calculator_w_covars(Y, xa_matrix[,i], xd_matrix[,i], covar_value)
+}
+
+scratch_with_covs_pvals <- scratch_with_covs_pvals
+
+plot_uniform_qq(scratch_with_covs_pvals, 'From Scratch With Covariates') + 
+  plot_manhattan(scratch_with_covs_pvals)
+```
+
+### **Comparing**
+
+```{r}
+(
+  plot_manhattan(scratch_no_covs_pvals) + 
+  plot_manhattan(scratch_with_covs_pvals)
+) / 
+(
+  plot_manhattan(lm_no_covs_pvals) + 
+  plot_manhattan(lm_with_covs_pvals)
+)
+```
+
+
+```{r}
+not_the_same <- which(!near(lm_with_covs_pvals, scratch_with_covs_pvals)) %>%     unname()
+
+ggplot() + 
+  geom_point(aes(x = lm_with_covs_pvals[not_the_same] %>% unname(), 
+                 y = scratch_with_covs_pvals[not_the_same])) + 
+  geom_abline(aes(intercept = 0, slope = 1), 
+              color = 'red', lty = 2) + 
+  xlab('LM()') + 
+  ylab('From Scratch')
+```
+
+## **Logistic Regression GWAS**
+
+```{r}
+## IRLS -- Iteratively Reweighted Least Squares
+
+logistic.IRLS <- function(X_mx,
+                          Y = Y, 
+                          beta.initial.vec = c(0,0,0),
+                          d.stop.th = 1e-6, 
+                          it.max = 100) {
+  
+	#initialize the beta parameter vector at t=0
+	beta_t <- beta.initial.vec
+  
+  # initialize deviance at d[t]
+	dt <- 0
+	
+	# initialize gamma
+  K <- X_mx %*% beta_t
+  gamma_inv <- exp(K)/(1+exp(K))
+	
+	for(i in 1:it.max) {
+	  #store previous deviance
+		dpt1 <- dt 
+		
+    # create empty matrix W
+		W <- (gamma_inv * (1- gamma_inv)) %>% 
+		  as.vector() %>% 
+		  diag()
+		
+		
+		  
+		# Update Beta
+		beta_t <- beta_t + 
+		  ginv(t(X_mx)%*%W%*%X_mx)%*%t(X_mx)%*%(Y-gamma_inv)
+		
+		
+		#update gamma since it's a function of beta
+    K <- X_mx %*% beta_t
+    gamma_inv <- exp(K)/(1+exp(K))
+    
+		#calculate new deviance
+		dt <- 
+		  2*(sum(Y[Y==1]*log(Y[Y==1]/gamma_inv[Y==1])) +
+        sum((1-Y[Y==0])*log((1-Y[Y==0])/(1-gamma_inv[Y==0]))))
+		
+		absD <- abs(dt - dpt1)
+		
+		# If the absolute difference in the deviance and the 
+		# previous deviance 
+		if(absD < d.stop.th) {
+			# Reached convergence
+			logl <- sum(Y*log(gamma_inv)+(1-Y)*log(1-gamma_inv))
+			return(list(beta_t,logl))
+		}	
+	}
+	
+  # Did not reach convergence 
+  return(list(beta_t= c(NA,NA,NA),logl=NA))
+}
+
+logistic.IRLS.pval <- function(Xa, 
+                               Xd,
+                               Y, 
+                               covar_mat = NULL, 
+                               beta.initial.vec = c(0,0,0),
+                               d.stop.th = 1e-6, it.max = 100) {
+  
+  #Initialize
+  if (is.null(covar_mat)) {
+    beta_t <- beta.initial.vec
+    X_mx <- cbind(rep(1,nrow(Y)), 
+                  Xa, Xd)
+  } else {
+    beta_t <- c(beta.initial.vec, rep(0, ncol(covar_mat)))
+    X_mx <- cbind(rep(1,nrow(Y)), 
+                  Xa, Xd, 
+                  covar_mat)
+  }
+  
+	dt <- 0
+  
+  # Calculating if needed for inference?
+  K <- X_mx %*% beta_t
+  gamma_inv <- exp(K)/(1+exp(K))
+  
+  
+	h1 <- logistic.IRLS(X_mx, 
+	                    Y=Y,
+	                    beta.initial.vec = beta_t,
+	                    d.stop.th = 1e-6, it.max = 100)
+	
+	
+	if (is.null(covar_mat)) {
+  	X_mx <- cbind(rep(1,nrow(Y)), 
+  	              rep(0,nrow(Y)),
+  	              rep(0,nrow(Y)))
+  } else {
+  	X_mx <- cbind(rep(1,nrow(Y)), 
+  	              rep(0,nrow(Y)),
+  	              rep(0,nrow(Y)), 
+  	              covar_mat)
+  }
+	
+
+	
+  # Calculating if needed for inference?
+  K <- X_mx %*% beta_t
+  gamma_inv <- exp(K)/(1+exp(K))  
+	
+  h0 <- logistic.IRLS(X_mx, Y=Y, 
+                      beta.initial.vec = beta_t, 
+	                    d.stop.th = 1e-6, it.max = 100)
+  
+	# Calculate the Likelihood Ratio Test (LRT) statistic
+	LRT <- (2 * h1[[2]]) - (2 * h0[[2]]) 
+	
+	# Calculate p-value from chi-squared distribution
+  pval <- pchisq(LRT, 2, lower.tail = F)
+  
+	return(pval)
+}
+```
+
+
+```{r}
+logistic_reg_no_covs_p_values   <- rep(0,ncol(xa_matrix))
+logistic_reg_with_covs_p_values <- rep(0,ncol(xa_matrix))
+
+for (i in 1:ncol(xa_matrix)) {
+  logistic_reg_no_covs_p_values[i] <- 
+      logistic.IRLS.pval(Xa = xa_matrix[,i], 
+                         Xd = xd_matrix[,i], 
+                         Y)
+  
+  logistic_reg_with_covs_p_values[i] <- 
+    logistic.IRLS.pval(Xa = xa_matrix[,i], 
+                       Xd = xd_matrix[,i], 
+                       Y, 
+                       covar = as.matrix(covar_value))
+}
+
+(
+  plot_uniform_qq(logistic_reg_no_covs_p_values, 'Logistic Regression No Covariates') + 
+  plot_uniform_qq(logistic_reg_with_covs_p_values, 'Logistic Regression With Covariates') 
+) / 
+(
+  plot_manhattan(logistic_reg_no_covs_p_values) + 
+  plot_manhattan(logistic_reg_with_covs_p_values)
+)
+
+  
+```
+
+```{r}
+data.frame(logistic_reg_no_covs_p_values, 
+           logistic_reg_with_covs_p_values) %>% 
+  ggplot() + 
+    geom_point(aes(x = logistic_reg_no_covs_p_values, 
+                   y = logistic_reg_with_covs_p_values)) + 
+  geom_abline(aes(intercept = 0, slope = 1), 
+              col = 'red', lty = 2)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
